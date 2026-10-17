@@ -1,6 +1,9 @@
 # dsh-continue-on-limit profile patch (activated via dsh.bundle once installed):
 # the client rides the additive `conversation.session.header.actions` list seat,
 # so nothing in the stock composition is replaced or disabled.
+# Harness 0.2.0 config channel: override this entry's `config` from the profile's
+# own cordis.patch.yml (plugin config schema = the package's `Config` export) —
+# the removed `settings.register()` namespace is no longer used.
 - insert:
     - id: ui-continue-on-limit
       name: 'dsh-continue-on-limit'

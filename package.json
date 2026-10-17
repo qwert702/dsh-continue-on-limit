@@ -1,7 +1,7 @@
 {
   "name": "dsh-continue-on-limit",
-  "version": "0.1.0",
-  "description": "Auto-continue for the DeepSeek Harness Web GUI: when a small local model hits its output-token cap and the conversation shows the max-tokens notice, the plugin automatically sends a short \"continue\" message so the reply keeps flowing without a manual click.",
+  "version": "0.2.0",
+  "description": "Auto-continue for the DeepSeek Harness Web GUI (harness 0.2.0): when a small local model hits its output-token cap at the tail of a session, a host-side session projection publishes the notice and the plugin automatically sends a short \"continue\" message so the reply keeps flowing without a manual click.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -20,9 +20,9 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session"
       ]
     }
   },

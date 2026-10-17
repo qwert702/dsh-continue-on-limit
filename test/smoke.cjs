@@ -1,15 +1,14 @@
-// Smoke test for dsh-continue-on-limit:
+// Smoke test for dsh-continue-on-limit (harness 0.2.0 config + projection era):
 // 1. node --check on lib/index.js + lib/client.js
-// 2. Host half: apply() registers the GET /api/dsh-continue-on-limit/config
-//    route; the handler resolves the settings namespace (defaults when the
-//    namespace is absent, overrides when configured) and rejects non-GET verbs.
-// 3. Client bundle: the additive header.actions registration + the plugin's OWN
-//    max-tokens chat-node definition (registered on conversationEvents, null
-//    view on conversation.chat.node), the pure detection across every branch
-//    (disabled / busy / queued / no-notice / not-tail / handled / cooldown /
-//    cap / send) with the dual source (legacy nodes + chat snapshot), the
-//    chain-reset policy, loadConfig against a mocked fetch, and the SSR null
-//    render.
+// 2. Host half: exports name/inject/Config (the loader config channel); apply()
+//    registers the `continueMaxTokens` session projection and the
+//    GET /api/dsh-continue-on-limit/config route; the projection fold arms the
+//    notice on a max-tokens turn/end and retires it on every later flow event;
+//    the route returns the composition defaults or the apply() config and
+//    rejects non-GET verbs.
+// 3. Client bundle: the additive header.actions registration (and nothing else),
+//    the pure evaluate() policy across every branch, the chain-reset policy,
+//    loadConfig against a mocked fetch, and the SSR null render.
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -33,32 +32,72 @@ execFileSync(process.execPath, ['--check', bundle], { stdio: 'inherit' });
 execFileSync(process.execPath, ['--check', hostFile], { stdio: 'inherit' });
 console.log('OK: node --check passed (client.js + index.js)');
 
-// --- 2. host route tests ---
+// --- 2. host half: Config export, projection fold, config route ---
 async function hostTests() {
   const host = await import('file:///' + hostFile.replace(/\\/g, '/'));
   if (host.name !== 'dsh-continue-on-limit-host') throw new Error('bad host name: ' + host.name);
-  for (const service of ['webServer', 'settings']) {
+  for (const service of ['webServer', 'sessionProjections']) {
     if (!host.inject.includes(service)) throw new Error('host missing inject: ' + service);
   }
+  if (host.inject.includes('settings')) throw new Error('host must not inject the removed settings service');
+  if (typeof host.Config?.['~standard']?.validate !== 'function') throw new Error('Config is not a Standard Schema');
+  console.log('OK: host exports name/inject/Config (loader config channel)');
 
   const registeredRoutes = [];
-  let namespaceConfig = null;
+  const projections = [];
   const ctx = {
     effect(fn) { fn(); },
     inject(services, cb) {
+      if (!services.includes('sessionProjections')) throw new Error('unexpected inject: ' + JSON.stringify(services));
       cb({
-        settings: { register: () => ({ get: () => namespaceConfig }) },
+        sessionProjections: {
+          register(definition) { projections.push(definition); return () => {}; },
+        },
       });
     },
     webServer: {
       register(route) { registeredRoutes.push(route); return () => {}; },
     },
   };
+
+  // bare mount -> composition defaults
   host.apply(ctx);
   const route = registeredRoutes.find((r) => r.path === '/api/dsh-continue-on-limit/config');
   if (route === undefined) throw new Error('config route not registered');
   if (route.kind !== 'exact') throw new Error('wrong route kind: ' + JSON.stringify(route));
-  console.log('OK: host registers the config route');
+
+  const definition = projections[0];
+  if (definition === undefined) throw new Error('continueMaxTokens projection not registered');
+  if (definition.key !== 'continueMaxTokens') throw new Error('wrong projection key: ' + definition.key);
+  if (typeof definition.init !== 'function' || typeof definition.apply !== 'function') throw new Error('projection unit functions missing');
+  if (definition.wire === undefined || typeof definition.wire.view !== 'function') throw new Error('projection wire view missing');
+  const empty = definition.init();
+  if (empty.notice !== null || empty.retired !== null) throw new Error('projection init wrong: ' + JSON.stringify(empty));
+  console.log('OK: host registers the continueMaxTokens projection unit');
+
+  /** Fold a fresh state through a list of events. */
+  const fold = (events) => events.reduce((state, event) => definition.apply(state, event), definition.init());
+  const maxTokensEnd = { type: 'turn/end', seq: 10, time: 100, data: { turn: 2, reason: { kind: 'max-tokens' } } };
+  const normalEnd = { type: 'turn/end', seq: 40, time: 400, data: { turn: 3, reason: { kind: 'completed' } } };
+  const humanMsg = { type: 'user/message', seq: 30, time: 300, data: { role: 'user', content: [{ type: 'text', text: '换个问题' }], source: {} } };
+  const turnStart = { type: 'turn/start', seq: 20, time: 200, data: { turn: 3 } };
+  const irrelevant = { type: 'assistant/message', seq: 9, time: 90, data: { turn: 2, step: 1 } };
+
+  let state = fold([maxTokensEnd]);
+  if (state.notice === null || state.notice.seq !== 10 || state.notice.turn !== 2) throw new Error('max-tokens turn/end must arm the notice: ' + JSON.stringify(state));
+  if (state.retired !== null) throw new Error('a fresh notice must not carry a retirement');
+  const armed = state;
+  if (definition.apply(armed, irrelevant) !== armed) throw new Error('uninterested events must keep the state reference');
+  state = fold([maxTokensEnd, turnStart]);
+  if (state.notice !== null || state.retired?.kind !== 'turn-start' || state.retired.seq !== 20) throw new Error('turn/start must retire the notice: ' + JSON.stringify(state));
+  state = fold([maxTokensEnd, humanMsg]);
+  if (state.notice !== null || state.retired?.kind !== 'user' || state.retired.text !== '换个问题') throw new Error('user message must retire the notice with its text: ' + JSON.stringify(state));
+  state = fold([maxTokensEnd, normalEnd]);
+  if (state.notice !== null || state.retired?.kind !== 'turn-end') throw new Error('a normal turn/end must retire the notice: ' + JSON.stringify(state));
+  const wired = definition.wire.view(armed);
+  if (wired !== armed) throw new Error('wire view must publish the state object itself');
+  if (definition.wire.viewSchema['~standard'].validate(wired).issues !== undefined) throw new Error('wire viewSchema rejected the armed state');
+  console.log('OK: projection fold arms and retires the output-cap notice');
 
   function fakeRes() {
     let status = 0;
@@ -73,8 +112,6 @@ async function hostTests() {
     };
   }
 
-  // absent namespace -> defaults
-  namespaceConfig = null;
   let f = fakeRes();
   await route.handler({ method: 'GET' }, f.res);
   let parsed = JSON.parse(f.body());
@@ -84,17 +121,23 @@ async function hostTests() {
   }
   console.log('OK: host route returns composition defaults');
 
-  // configured namespace -> overrides
-  namespaceConfig = { enabled: false, continueText: '请继续', maxConsecutive: 5, minIntervalMs: 800 };
+  // apply(config) -> overrides from the profile entry
+  const configuredRoutes = [];
+  const configuredCtx = {
+    effect(fn) { fn(); },
+    inject(services, cb) { cb({ sessionProjections: { register() { return () => {}; } } }); },
+    webServer: { register(r) { configuredRoutes.push(r); return () => {}; } },
+  };
+  host.apply(configuredCtx, { enabled: false, continueText: '请继续', maxConsecutive: 5, minIntervalMs: 800 });
+  const configuredRoute = configuredRoutes.find((r) => r.path === '/api/dsh-continue-on-limit/config');
   f = fakeRes();
-  await route.handler({ method: 'GET' }, f.res);
+  await configuredRoute.handler({ method: 'GET' }, f.res);
   parsed = JSON.parse(f.body());
   if (parsed.config.enabled !== false || parsed.config.continueText !== '请继续' || parsed.config.maxConsecutive !== 5 || parsed.config.minIntervalMs !== 800) {
     throw new Error('overrides wrong: ' + JSON.stringify(parsed.config));
   }
-  console.log('OK: host route returns configured overrides');
+  console.log('OK: host route returns the apply() config overrides');
 
-  // non-GET -> 405
   f = fakeRes();
   await route.handler({ method: 'POST' }, f.res);
   parsed = JSON.parse(f.body());
@@ -135,24 +178,19 @@ async function clientTests() {
   }
   console.log('OK: client bundle loads, inject slots+sessions');
 
-  // registration: own max-tokens definition + null view + header.actions entry
-  const registeredDefinitions = [];
+  // registration: exactly one additive header.actions entry, no chat-node seat
+  const seats = [];
   const entries = [];
+  const sessionsMock = {
+    list: { getSnapshot: () => ({ ids: ['session-1'], byId: {} }) },
+    binding: () => undefined,
+  };
   const ctx = {
-    get: (name) => {
-      if (name === 'sessions') return sessionsMock;
-      if (name === 'conversationEvents') return {
-        register(def) { registeredDefinitions.push(def); return () => {}; },
-      };
-      return undefined;
-    },
+    get: (name) => (name === 'sessions' ? sessionsMock : undefined),
     slots: {
       inject(key, factory) {
-        if (key !== 'conversation.chat.node' && key !== 'conversation.session.header.actions') {
-          throw new Error('wrong injected seat: ' + key);
-        }
-        const registerCall = factory();
-        registerCall();
+        seats.push(key);
+        factory();
         return () => {};
       },
       register(opts, component) {
@@ -161,136 +199,74 @@ async function clientTests() {
       },
     },
   };
-  const sessionsMock = {
-    list: {
-      getSnapshot: () => ({ ids: ['session-1'], byId: {}, current: 'session-1' }),
-    },
-    binding: () => undefined,
-  };
   client.apply(ctx);
-
-  const definition = registeredDefinitions[0];
-  if (definition === undefined) throw new Error('own max-tokens definition not registered');
-  if (definition.kind !== 'continue-max-tokens') throw new Error('wrong definition kind: ' + definition.kind);
-  if (definition.target !== 'chat') throw new Error('wrong definition target: ' + definition.target);
-  const matched = definition.match({ type: 'turn/end', seq: 200, time: 1, data: { turn: 4, reason: { kind: 'max-tokens' } } });
-  if (matched === null || matched.id !== '4' || matched.role !== 'start') throw new Error('definition match wrong: ' + JSON.stringify(matched));
-  if (definition.match({ type: 'turn/end', seq: 201, time: 1, data: { turn: 5, reason: { kind: 'stop' } } }) !== null) throw new Error('definition matched a non-max-tokens turn/end');
-  if (definition.match({ type: 'assistant/message', seq: 202, time: 1, data: {} }) !== null) throw new Error('definition matched a non-turn/end event');
-  const state = definition.start({}, { event: { type: 'turn/end', seq: 200, time: 1, data: { turn: 4, reason: { kind: 'max-tokens' } } } });
-  if (state.turn !== 4 || state.seq !== 200) throw new Error('definition start state wrong: ' + JSON.stringify(state));
-  const built = definition.buildViewNode({ state, key: 'k-1', id: '4', start: { location: { kind: 'turn', turn: {} } }, matches: [] });
-  if (built.kind !== 'continue-max-tokens' || built.visibility !== 'hidden' || built.data.seq !== 200 || built.data.turn !== 4) {
-    throw new Error('definition buildViewNode wrong: ' + JSON.stringify(built));
+  if (seats.length !== 1 || seats[0] !== 'conversation.session.header.actions') {
+    throw new Error('wrong injected seats: ' + JSON.stringify(seats));
   }
-  const nullView = entries.find((e) => e.opts.name === 'conversation.chat.node' && e.opts.key === 'continue-max-tokens');
-  if (nullView === undefined) throw new Error('null view for continue-max-tokens not registered');
   const action = entries.find((e) => e.opts.name === 'conversation.session.header.actions');
   if (action === undefined) throw new Error('header.actions entry not registered');
   if (action.opts.id !== 'continue-on-limit' || action.opts.priority !== 10) throw new Error('wrong header action opts: ' + JSON.stringify(action.opts));
-  console.log('OK: client registers own max-tokens definition, null view, and header.actions entry');
+  console.log('OK: client registers the invisible header.actions entry only');
 
-  // --- collectNoticeCandidates + evaluate() policy branches ---
+  // --- evaluate() policy branches ---
   const config = { enabled: true, continueText: '继续', maxConsecutive: 3, minIntervalMs: 1500 };
-  const notice = { kind: 'turn-max-tokens', seq: 100.05, time: 1, turn: 2, step: 0 };
-  const ownNotice = { kind: 'continue-max-tokens', seq: 100, time: 1, turn: 2, step: 0 };
-  const frozen = { kind: 'assistant', seq: 99.1, time: 1, turn: 2, step: 0, blocks: [], interrupted: true };
-  const userMsg = { kind: 'user', seq: 0, time: 0, content: [{ type: 'text', text: '写一个脚本' }], source: {} };
-  const chatNodes = (nodes) => ({ nodes: { values: () => nodes } });
+  const notice = { turn: 2, seq: 100.05, time: 1 };
+  const projection = { notice, retired: null };
   const baseSnapshot = {
     sessionId: 'session-1',
-    nodes: [userMsg, frozen, notice],
-    chat: chatNodes([]),
-    queue: [],
-    pending: [],
+    pendingSubmissions: [],
     running: false,
     removed: false,
     openState: 'open',
   };
   const freshState = () => ({ lastNoticeSeq: -1, consecutive: 0, lastSentAt: 0 });
 
-  // disabled
-  let verdict = client.evaluate(baseSnapshot, freshState(), { ...config, enabled: false }, 1000);
+  let verdict = client.evaluate(baseSnapshot, projection, freshState(), { ...config, enabled: false }, 1000);
   if (verdict.action !== 'disabled') throw new Error('disabled branch: ' + JSON.stringify(verdict));
-  // removed / not-open / running / queued
-  verdict = client.evaluate({ ...baseSnapshot, removed: true }, freshState(), config, 1000);
+  verdict = client.evaluate({ ...baseSnapshot, removed: true }, projection, freshState(), config, 1000);
   if (verdict.action !== 'removed') throw new Error('removed branch: ' + JSON.stringify(verdict));
-  verdict = client.evaluate({ ...baseSnapshot, openState: 'loading' }, freshState(), config, 1000);
+  verdict = client.evaluate({ ...baseSnapshot, openState: 'loading' }, projection, freshState(), config, 1000);
   if (verdict.action !== 'not-open') throw new Error('not-open branch: ' + JSON.stringify(verdict));
-  verdict = client.evaluate({ ...baseSnapshot, running: true }, freshState(), config, 1000);
+  verdict = client.evaluate({ ...baseSnapshot, running: true }, projection, freshState(), config, 1000);
   if (verdict.action !== 'running') throw new Error('running branch: ' + JSON.stringify(verdict));
-  verdict = client.evaluate({ ...baseSnapshot, queue: [{ id: 'q-1' }] }, freshState(), config, 1000);
+  verdict = client.evaluate({ ...baseSnapshot, pendingSubmissions: [{ requestId: 'r-1' }] }, projection, freshState(), config, 1000);
   if (verdict.action !== 'queued') throw new Error('queued branch: ' + JSON.stringify(verdict));
-  verdict = client.evaluate({ ...baseSnapshot, pending: [{ id: 'p-1' }] }, freshState(), config, 1000);
-  if (verdict.action !== 'queued') throw new Error('pending branch: ' + JSON.stringify(verdict));
-  // no notice (neither source)
-  verdict = client.evaluate({ ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([]) }, freshState(), config, 1000);
+  verdict = client.evaluate(baseSnapshot, { notice: null, retired: { seq: 120, kind: 'user', text: '我自己来' } }, freshState(), config, 1000);
   if (verdict.action !== 'no-notice') throw new Error('no-notice branch: ' + JSON.stringify(verdict));
-  // notice not the tail (a later user message exists in the visible flow)
-  verdict = client.evaluate({ ...baseSnapshot, nodes: [userMsg, frozen, notice, { ...userMsg, seq: 120, content: [{ type: 'text', text: '再写一个' }] }] }, freshState(), config, 1000);
-  if (verdict.action !== 'not-tail') throw new Error('not-tail branch: ' + JSON.stringify(verdict));
-  // handled
-  verdict = client.evaluate(baseSnapshot, { lastNoticeSeq: 100.05, consecutive: 1, lastSentAt: 0 }, config, 1000);
+  verdict = client.evaluate(baseSnapshot, undefined, freshState(), config, 1000);
+  if (verdict.action !== 'no-notice') throw new Error('missing projection must be a no-notice branch: ' + JSON.stringify(verdict));
+  verdict = client.evaluate(baseSnapshot, projection, { lastNoticeSeq: 100.05, consecutive: 1, lastSentAt: 0 }, config, 1000);
   if (verdict.action !== 'handled') throw new Error('handled branch: ' + JSON.stringify(verdict));
-  // cooldown
-  verdict = client.evaluate(baseSnapshot, { lastNoticeSeq: -1, consecutive: 1, lastSentAt: 9900 }, config, 10000);
+  verdict = client.evaluate(baseSnapshot, projection, { lastNoticeSeq: -1, consecutive: 1, lastSentAt: 9900 }, config, 10000);
   if (verdict.action !== 'cooldown') throw new Error('cooldown branch: ' + JSON.stringify(verdict));
-  // cap (consecutive >= maxConsecutive), notice is returned for marking handled
-  verdict = client.evaluate(baseSnapshot, { lastNoticeSeq: -1, consecutive: 3, lastSentAt: 0 }, config, 10000);
+  verdict = client.evaluate(baseSnapshot, projection, { lastNoticeSeq: -1, consecutive: 3, lastSentAt: 0 }, config, 10000);
   if (verdict.action !== 'cap' || verdict.notice !== notice) throw new Error('cap branch: ' + JSON.stringify(verdict));
-  // send
-  verdict = client.evaluate(baseSnapshot, freshState(), config, 10000);
+  verdict = client.evaluate(baseSnapshot, projection, freshState(), config, 10000);
   if (verdict.action !== 'send' || verdict.notice !== notice) throw new Error('send branch: ' + JSON.stringify(verdict));
   console.log('OK: evaluate() covers every branch');
 
-  // --- dual-source detection ---
-  // The harness's own turn-max-tokens lives only in the chat snapshot (older
-  // ui-conversation without the legacy projection case): still detected.
-  const chatOnlyNotice = { ...notice, seq: 100 };
-  let chatSnapshot = { ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([{ kind: 'turn-max-tokens', data: chatOnlyNotice }]) };
-  verdict = client.evaluate(chatSnapshot, freshState(), config, 10000);
-  if (verdict.action !== 'send' || verdict.notice.seq !== 100) throw new Error('chat-only notice not detected: ' + JSON.stringify(verdict));
-  // The plugin's OWN node fires when the harness ships no turn-max-tokens at
-  // all (legacy flow ends at the frozen assistant, seq < own notice seq).
-  const ownSnapshot = { ...baseSnapshot, nodes: [userMsg, frozen], chat: chatNodes([{ kind: 'continue-max-tokens', data: ownNotice }]) };
-  verdict = client.evaluate(ownSnapshot, freshState(), config, 10000);
-  if (verdict.action !== 'send' || verdict.notice !== ownNotice) throw new Error('own definition not detected: ' + JSON.stringify(verdict));
-  // ... but a human message after the truncation still blocks it.
-  const humanAfter = { ...baseSnapshot, nodes: [userMsg, frozen, { ...userMsg, seq: 150, content: [{ type: 'text', text: '我自己来' }] }], chat: chatNodes([{ kind: 'continue-max-tokens', data: ownNotice }]) };
-  verdict = client.evaluate(humanAfter, freshState(), config, 10000);
-  if (verdict.action !== 'not-tail') throw new Error('human after own notice must block: ' + JSON.stringify(verdict));
-  // Dedup: the same truncation surfacing in both sources produces ONE candidate.
-  const both = { ...baseSnapshot, nodes: [userMsg, frozen, notice], chat: chatNodes([
-    { kind: 'turn-max-tokens', data: notice },
-    { kind: 'continue-max-tokens', data: { ...ownNotice, seq: 100 } },
-  ]) };
-  const candidates = client.collectNoticeCandidates(both);
-  const seqs = candidates.map((c) => c.seq).sort((a, b) => a - b);
-  if (candidates.length !== 2 || seqs[0] !== 100 || seqs[1] !== 100.05) {
-    throw new Error('candidate dedup wrong: ' + JSON.stringify(seqs));
-  }
-  verdict = client.evaluate(both, freshState(), config, 10000);
-  if (verdict.action !== 'send') throw new Error('both-sources snapshot must send once: ' + JSON.stringify(verdict));
-  console.log('OK: dual-source detection + dedup');
-
   // --- evaluateReset() ---
-  // our own auto-continue message must NOT reset the chain
-  const continueUser = { kind: 'user', seq: 101, time: 1, content: [{ type: 'text', text: '继续' }], source: {} };
-  let reset = client.evaluateReset({ ...baseSnapshot, nodes: [userMsg, frozen, notice, continueUser] }, { lastNoticeSeq: 100.05, consecutive: 1 }, config);
-  if (reset) throw new Error('our continue must not reset the chain');
-  // a frozen (still truncated) assistant must NOT reset the chain
-  const laterFrozen = { ...frozen, seq: 109.1, turn: 3 };
-  const notice2 = { ...notice, seq: 110.05, turn: 3 };
-  reset = client.evaluateReset({ ...baseSnapshot, nodes: [userMsg, frozen, notice, continueUser, laterFrozen, notice2] }, { lastNoticeSeq: 100.05, consecutive: 1 }, config);
-  if (reset) throw new Error('frozen assistant must not reset the chain');
-  // a normally completed assistant resets
-  const finalized = { kind: 'assistant', seq: 120, time: 1, turn: 3, step: 0, blocks: [{ kind: 'text', text: '完成' }], messageId: 'm-1' };
-  reset = client.evaluateReset({ ...baseSnapshot, nodes: [userMsg, frozen, notice, continueUser, finalized] }, { lastNoticeSeq: 100.05, consecutive: 1 }, config);
-  if (!reset) throw new Error('completed assistant must reset the chain');
-  // a human message that is not our continue resets
-  const human = { kind: 'user', seq: 130, time: 1, content: [{ type: 'text', text: '换个问题' }], source: {} };
-  reset = client.evaluateReset({ ...baseSnapshot, nodes: [userMsg, frozen, notice, continueUser, finalized, human] }, { lastNoticeSeq: 100.05, consecutive: 1 }, config);
-  if (!reset) throw new Error('human message must reset the chain');
+  if (client.evaluateReset({ notice: null, retired: null }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('no retirement must not reset the chain');
+  }
+  if (client.evaluateReset({ notice: null, retired: { seq: 90, kind: 'turn-end', text: null } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('a retirement older than the handled notice must not reset');
+  }
+  if (!client.evaluateReset({ notice: null, retired: { seq: 130, kind: 'turn-end', text: null } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('a normally closed turn must reset the chain');
+  }
+  if (!client.evaluateReset({ notice: null, retired: { seq: 130, kind: 'user', text: '换个问题' } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('a foreign human message must reset the chain');
+  }
+  if (client.evaluateReset({ notice: null, retired: { seq: 130, kind: 'user', text: '继续' } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('our own auto-continue must not reset the chain');
+  }
+  if (!client.evaluateReset({ notice: null, retired: { seq: 130, kind: 'steering', text: '停一下' } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('a human steering message must reset the chain');
+  }
+  if (client.evaluateReset({ notice: null, retired: { seq: 130, kind: 'turn-start', text: null } }, { lastNoticeSeq: 100.05, consecutive: 1 }, config)) {
+    throw new Error('our own continue starting the next turn must not reset the chain');
+  }
   console.log('OK: evaluateReset() covers the chain-reset branches');
 
   // --- loadConfig() against a mocked fetch ---
@@ -322,6 +298,8 @@ async function clientTests() {
   const renderer = require(path.join(harnessModules, 'react-dom/server'));
   const html = renderer.renderToString(react.createElement(client.AutoContinue, {
     useSession: (sel) => sel(baseSnapshot),
+    useProjection: () => projection,
+    sessionId: 'session-1',
     sessions: sessionsMock,
   }));
   if (html !== '') throw new Error('observer must render nothing, got: ' + html);
